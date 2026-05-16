@@ -317,7 +317,6 @@
       <span id="status-txt">接続中...</span>
     </div>
     <button id="btn-md-view"  onclick="openMd()">MD</button>
-    <button id="btn-reset"    onclick="doReset()">リセット</button>
   </header>
 
   <div id="chat"></div>
@@ -475,13 +474,6 @@ function md(raw) {
   return s;
 }
 
-// ---- リセット ----
-async function doReset() {
-  if (!confirm('会話をリセットしますか？')) return;
-  await fetch('/api/reset', {method:'POST'});
-  chatEl.innerHTML = '';
-}
-
 // ---- MD 表示 ----
 async function openMd() {
   document.getElementById('md-modal').classList.add('open');
@@ -490,15 +482,6 @@ async function openMd() {
 }
 function closeMd() { document.getElementById('md-modal').classList.remove('open'); }
 function closeMdBg(e) { if (e.target.id === 'md-modal') closeMd(); }
-
-// ---- 履歴復元 ----
-async function loadHistory() {
-  try {
-    const r = await fetch('/api/history');
-    const h = await r.json();
-    h.forEach(m => m.role === 'user' ? addMe(m.content) : addAi(m.content));
-  } catch(_) {}
-}
 
 // ---- SSE ----
 function connectSSE() {
@@ -520,8 +503,9 @@ function connectSSE() {
       addAi(d.text);
       setBusy(false);
       if (document.getElementById('md-modal').classList.contains('open')) openMd();
-    } else if (d.type === 'reset') {
-      chatEl.innerHTML = '';
+    } else if (d.type === 'error') {
+      hideTyping();
+      addAi(d.text);
       setBusy(false);
     }
   };
@@ -535,7 +519,7 @@ function connectSSE() {
 }
 
 // ---- 起動 ----
-loadHistory().then(connectSSE);
+connectSSE();
 </script>
 </body>
 </html>
