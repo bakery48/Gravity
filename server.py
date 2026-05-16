@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -300,7 +300,7 @@ def main():
     print(f"  監視 MD     : {OUTPUT_MD}")
     print(f"  Ctrl+C で停止\n")
 
-    srv = HTTPServer(("0.0.0.0", PORT), Handler)
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
