@@ -43,12 +43,15 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 with open(CONFIG_PATH, encoding="utf-8") as _f:
     _cfg = json.load(_f)
 
-PORT             = _cfg.get("port", 8765)
-OUTPUT_MD        = Path(_cfg.get("output_md_path", "./output.md")).resolve()
-WINDOW_SUBSTR    = _cfg.get("window_title_substring", "Antigravity")
-SEND_KEY         = _cfg.get("send_key", "enter")             # "enter" or "ctrl+enter"
-PASTE_DELAY_MS   = _cfg.get("paste_delay_ms", 150)
-STATIC_DIR       = Path(__file__).parent / "static"
+PORT                  = _cfg.get("port", 8765)
+OUTPUT_MD             = Path(_cfg.get("output_md_path", "./output.md")).resolve()
+WINDOW_SUBSTR         = _cfg.get("window_title_substring", "Antigravity")
+SEND_KEY              = _cfg.get("send_key", "enter")
+PASTE_DELAY_MS        = _cfg.get("paste_delay_ms", 150)
+# チャット入力欄のクリック位置（ウィンドウ右端・下端からのオフセット px）
+CHAT_FROM_RIGHT       = _cfg.get("chat_click_from_right", 200)
+CHAT_FROM_BOTTOM      = _cfg.get("chat_click_from_bottom", 60)
+STATIC_DIR            = Path(__file__).parent / "static"
 
 # ---------------------------------------------------------------------------
 # グローバル状態
@@ -106,6 +109,16 @@ def send_to_antigravity(text: str) -> tuple[bool, str]:
                 pass
 
         time.sleep(PASTE_DELAY_MS / 1000)
+
+        # チャット入力欄をクリック（ウィンドウ右端・下端からのオフセット位置）
+        try:
+            click_x = win.left + win.width  - CHAT_FROM_RIGHT
+            click_y = win.top  + win.height - CHAT_FROM_BOTTOM
+            pyautogui.click(click_x, click_y)
+            print(f"[送信] クリック位置: ({click_x}, {click_y})")
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"[送信] クリック失敗（続行）: {e}")
 
         # クリップボード経由で貼付（日本語含む多バイト対応）
         prev_clip = ""
