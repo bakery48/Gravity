@@ -1,0 +1,7 @@
+{
+  "port": 8765,
+  "output_md_path": "./output.md",
+  "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY_HERE",
+  "model": "claude-sonnet-4-6",
+  "system_prompt": "あなたは親切なAIアシスタントです。日本語で丁寧に回答してください。"
+}
