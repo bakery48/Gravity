@@ -514,9 +514,32 @@ function connectSSE() {
     statusDot.className = 'offline';
     statusTxt.textContent = '切断 — 再接続中...';
     es.close();
-    setTimeout(connectSSE, 3000);
+    currentES = null;
+    if (!reconnectTimer) reconnectTimer = setTimeout(reconnect, 3000);
   };
+
+  currentES = es;
 }
+
+let currentES = null;
+let reconnectTimer = null;
+
+function reconnect() {
+  reconnectTimer = null;
+  if (currentES) { currentES.close(); currentES = null; }
+  connectSSE();
+}
+
+// バックグラウンドから戻ったとき再接続
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (!currentES || currentES.readyState === EventSource.CLOSED) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      reconnect();
+    }
+  }
+});
 
 // ---- 起動 ----
 connectSSE();
