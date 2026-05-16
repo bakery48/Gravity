@@ -146,10 +146,13 @@ def input_worker():
         text = msg_queue.get()
         if text is None:
             break
+        print(f"[送信] メッセージ受信: {text!r}")
         ok, info = send_to_antigravity(text)
         if not ok:
+            print(f"[送信] 失敗: {info}")
             push_sse({"type": "error", "text": f"[入力失敗] {info}"})
         else:
+            print(f"[送信] Antigravity へ入力完了")
             push_sse({"type": "thinking"})
 
 # ---------------------------------------------------------------------------
@@ -206,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
             self._md()
         elif p == "/api/events":
             self._sse()
+        elif p == "/api/windows":
+            self._windows()
         else:
             self._send(404, "text/plain", b"Not Found")
 
@@ -232,6 +237,10 @@ class Handler(BaseHTTPRequestHandler):
     def _md(self):
         content = OUTPUT_MD.read_text(encoding="utf-8") if OUTPUT_MD.exists() else ""
         self._send(200, "text/plain; charset=utf-8", content.encode())
+
+    def _windows(self):
+        titles = [w.title for w in gw.getAllWindows() if w.title.strip()]
+        self._json(200, {"windows": titles})
 
     def _sse(self):
         self.send_response(200)
