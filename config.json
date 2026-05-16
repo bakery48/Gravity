@@ -1,7 +1,0 @@
-{
-  "port": 8765,
-  "output_md_path": "./output.md",
-  "window_title_substring": "Antigravity",
-  "send_key": "enter",
-  "paste_delay_ms": 150
-}

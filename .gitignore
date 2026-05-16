@@ -1,0 +1,5 @@
+config.json
+output.md
+__pycache__/
+*.pyc
+antigravity_input.txt
