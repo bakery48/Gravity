@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
 AntiGravity Mobile Bridge Server
-スマホから同一LAN上のAntiGravityチャットへアクセスするためのブリッジサーバー
+- ユーザー入力を antigravity_input.txt に書き込む
+- Claude API が返答を output.md に追記する
+- output.md の変化（差分）をSSEでスマホへリアルタイム送信
 """
 
 import json
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 try:
     import anthropic
@@ -21,250 +24,313 @@ except ImportError:
     exit(1)
 
 # ---------------------------------------------------------------------------
-# 設定読み込み
+# 設定
 # ---------------------------------------------------------------------------
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
-def load_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+with open(CONFIG_PATH, encoding="utf-8") as _f:
+    _cfg = json.load(_f)
 
-config = load_config()
-PORT = config.get("port", 8765)
-OUTPUT_MD = Path(config.get("output_md_path", "./output.md"))
-API_KEY = config.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL = config.get("model", "claude-sonnet-4-6")
-SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant.")
+PORT        = _cfg.get("port", 8765)
+OUTPUT_MD   = Path(_cfg.get("output_md_path", "./output.md")).resolve()
+INPUT_FILE  = Path(_cfg.get("input_file", "./antigravity_input.txt")).resolve()
+API_KEY     = _cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+MODEL       = _cfg.get("model", "claude-sonnet-4-6")
+SYSTEM_PROMPT = _cfg.get("system_prompt", "あなたは親切なAIアシスタントです。日本語で回答してください。")
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR  = Path(__file__).parent / "static"
 
 # ---------------------------------------------------------------------------
 # グローバル状態
 # ---------------------------------------------------------------------------
-conversation_history = []        # Claude API用の会話履歴
-history_lock = threading.Lock()
+conv_history: list[dict] = []
+conv_lock    = threading.Lock()
 
-message_queue = queue.Queue()    # スマホからのメッセージキュー
-sse_clients = []                 # SSE接続中のクライアント
-sse_lock = threading.Lock()
+msg_queue    = queue.Queue()     # スマホ→処理キュー
+sse_clients: list[queue.Queue] = []
+sse_lock     = threading.Lock()
+
+# MDファイル監視用
+_md_prev_content = ""
+_md_prev_mtime   = 0.0
 
 # ---------------------------------------------------------------------------
-# SSE通知
+# SSE ブロードキャスト
 # ---------------------------------------------------------------------------
-def push_sse(event_data: dict):
-    payload = f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+def push_sse(payload: dict):
+    data = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
     with sse_lock:
-        dead = []
-        for q in sse_clients:
-            try:
-                q.put_nowait(payload)
-            except queue.Full:
-                dead.append(q)
+        dead = [q for q in sse_clients if _try_put(q, data)]
         for q in dead:
             sse_clients.remove(q)
 
+def _try_put(q: queue.Queue, data: str) -> bool:
+    try:
+        q.put_nowait(data)
+        return False
+    except queue.Full:
+        return True  # dead
+
 # ---------------------------------------------------------------------------
-# AntiGravity: メッセージ処理スレッド
+# MDファイル監視スレッド
+# ---------------------------------------------------------------------------
+def md_watcher():
+    """output.md を 500ms ごとに監視し、差分があれば SSE 送信"""
+    global _md_prev_content, _md_prev_mtime
+
+    # 起動時の初期値
+    if OUTPUT_MD.exists():
+        _md_prev_content = OUTPUT_MD.read_text(encoding="utf-8")
+        _md_prev_mtime   = OUTPUT_MD.stat().st_mtime
+
+    while True:
+        time.sleep(0.5)
+        if not OUTPUT_MD.exists():
+            continue
+        try:
+            mtime = OUTPUT_MD.stat().st_mtime
+            if mtime == _md_prev_mtime:
+                continue
+
+            new_content = OUTPUT_MD.read_text(encoding="utf-8")
+            if new_content == _md_prev_content:
+                _md_prev_mtime = mtime
+                continue
+
+            diff_text = _extract_diff(_md_prev_content, new_content)
+            _md_prev_content = new_content
+            _md_prev_mtime   = mtime
+
+            if diff_text:
+                push_sse({"type": "md_update", "text": diff_text})
+
+        except Exception:
+            pass
+
+def _extract_diff(old: str, new: str) -> str:
+    """
+    old と new の差分から表示用テキストを抽出する。
+    • 追記の場合: 追加された部分を返す
+    • 全書き換えの場合: new 全体を返す
+    差分からマークダウン装飾（**AntiGravity** ヘッダー・区切り線）を除去する。
+    """
+    if new.startswith(old):
+        raw = new[len(old):]
+    else:
+        raw = new  # 全書き換え
+
+    # "**AntiGravity**" ヘッダー行と "---" 区切りを除去
+    raw = re.sub(r"\*\*AntiGravity\*\*\s*", "", raw)
+    raw = re.sub(r"^---\s*$", "", raw, flags=re.MULTILINE)
+    # タイムスタンプ行 (## で始まる行) を除去
+    raw = re.sub(r"^##.*$", "", raw, flags=re.MULTILINE)
+    return raw.strip()
+
+# ---------------------------------------------------------------------------
+# AntiGravity 処理スレッド（Claude API → output.md 書き込み）
 # ---------------------------------------------------------------------------
 def antigravity_worker():
     client = anthropic.Anthropic(api_key=API_KEY)
+
     while True:
-        user_message = message_queue.get()
-        if user_message is None:
+        user_msg = msg_queue.get()
+        if user_msg is None:
             break
 
-        with history_lock:
-            conversation_history.append({"role": "user", "content": user_message})
-            messages_snapshot = list(conversation_history)
+        # 入力ファイルに書き出す（外部ツールとの連携用）
+        INPUT_FILE.write_text(user_msg + "\n", encoding="utf-8")
+
+        with conv_lock:
+            conv_history.append({"role": "user", "content": user_msg})
+            snapshot = list(conv_history)
 
         push_sse({"type": "thinking"})
 
         try:
-            response = client.messages.create(
+            resp = client.messages.create(
                 model=MODEL,
                 max_tokens=8096,
                 system=SYSTEM_PROMPT,
-                messages=messages_snapshot,
+                messages=snapshot,
             )
-            reply = response.content[0].text
+            reply = resp.content[0].text
         except Exception as e:
             reply = f"[エラー] {e}"
 
-        with history_lock:
-            conversation_history.append({"role": "assistant", "content": reply})
+        with conv_lock:
+            conv_history.append({"role": "assistant", "content": reply})
 
-        write_output_md()
-        push_sse({"type": "update"})
+        # output.md に追記 → md_watcher が差分を検知して SSE 送信
+        _append_to_md(user_msg, reply)
 
-def write_output_md():
-    """会話履歴全体をMDファイルに書き出す"""
+def _append_to_md(user_msg: str, reply: str):
     OUTPUT_MD.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# AntiGravity Chat\n"]
-    with history_lock:
-        for msg in conversation_history:
-            role_label = "**あなた**" if msg["role"] == "user" else "**AntiGravity**"
-            lines.append(f"{role_label}\n\n{msg['content']}\n\n---\n")
-    OUTPUT_MD.write_text("".join(lines), encoding="utf-8")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if not OUTPUT_MD.exists() or OUTPUT_MD.read_text(encoding="utf-8").strip() == "":
+        header = "# AntiGravity Chat\n\n"
+    else:
+        header = ""
+
+    block = (
+        f"{header}"
+        f"## {ts}\n\n"
+        f"**あなた**\n\n{user_msg}\n\n"
+        f"**AntiGravity**\n\n{reply}\n\n"
+        f"---\n\n"
+    )
+    with open(OUTPUT_MD, "a", encoding="utf-8") as f:
+        f.write(block)
 
 # ---------------------------------------------------------------------------
-# HTTPハンドラ
+# HTTP ハンドラ
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] {fmt % args}")
+        print(f"[{datetime.now():%H:%M:%S}] {fmt % args}")
 
-    # ---- ルーティング ----
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path in ("/", "/index.html"):
-            self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
-        elif path == "/api/history":
-            self._handle_history()
-        elif path == "/api/md":
-            self._handle_md()
-        elif path == "/api/events":
-            self._handle_sse()
+        p = urlparse(self.path).path
+        routes = {
+            "/":           lambda: self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8"),
+            "/index.html": lambda: self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8"),
+            "/api/history":lambda: self._history(),
+            "/api/md":     lambda: self._md(),
+            "/api/events": lambda: self._sse(),
+        }
+        handler = routes.get(p)
+        if handler:
+            handler()
         else:
             self._send(404, "text/plain", b"Not Found")
 
     def do_POST(self):
-        if self.path == "/api/send":
-            self._handle_send()
-        elif self.path == "/api/reset":
-            self._handle_reset()
-        else:
-            self._send(404, "text/plain", b"Not Found")
+        p = self.path
+        if p == "/api/send":   self._send_msg()
+        elif p == "/api/reset":self._reset()
+        else: self._send(404, "text/plain", b"Not Found")
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self._cors_headers()
+        self._cors()
         self.end_headers()
 
-    # ---- エンドポイント実装 ----
-    def _handle_send(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
+    # ---- エンドポイント ----
+
+    def _send_msg(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         try:
-            data = json.loads(body)
-            text = data.get("message", "").strip()
+            text = json.loads(body).get("message", "").strip()
         except Exception:
-            self._send(400, "application/json", b'{"error":"invalid json"}')
-            return
-
+            return self._json(400, {"error": "invalid json"})
         if not text:
-            self._send(400, "application/json", b'{"error":"empty message"}')
-            return
+            return self._json(400, {"error": "empty message"})
+        msg_queue.put(text)
+        self._json(200, {"status": "queued"})
 
-        message_queue.put(text)
-        self._send_json({"status": "queued"})
-
-    def _handle_reset(self):
-        with history_lock:
-            conversation_history.clear()
+    def _reset(self):
+        with conv_lock:
+            conv_history.clear()
         if OUTPUT_MD.exists():
-            OUTPUT_MD.write_text("# AntiGravity Chat\n", encoding="utf-8")
-        push_sse({"type": "update"})
-        self._send_json({"status": "reset"})
+            OUTPUT_MD.write_text("", encoding="utf-8")
+        global _md_prev_content, _md_prev_mtime
+        _md_prev_content = ""
+        _md_prev_mtime   = 0.0
+        push_sse({"type": "reset"})
+        self._json(200, {"status": "reset"})
 
-    def _handle_history(self):
-        with history_lock:
-            data = list(conversation_history)
-        self._send_json(data)
+    def _history(self):
+        with conv_lock:
+            data = list(conv_history)
+        self._json(200, data)
 
-    def _handle_md(self):
-        if OUTPUT_MD.exists():
-            content = OUTPUT_MD.read_text(encoding="utf-8")
-        else:
-            content = "# AntiGravity Chat\n\nまだ会話がありません。"
-        self._send(200, "text/plain; charset=utf-8", content.encode("utf-8"))
+    def _md(self):
+        content = OUTPUT_MD.read_text(encoding="utf-8") if OUTPUT_MD.exists() else ""
+        self._send(200, "text/plain; charset=utf-8", content.encode())
 
-    def _handle_sse(self):
+    def _sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self._cors_headers()
+        self._cors()
         self.end_headers()
 
-        client_q = queue.Queue(maxsize=50)
+        q: queue.Queue = queue.Queue(maxsize=100)
         with sse_lock:
-            sse_clients.append(client_q)
-
+            sse_clients.append(q)
         try:
-            # 接続直後に現在の状態を送る
-            self.wfile.write(b"data: {\"type\":\"connected\"}\n\n")
+            self.wfile.write(b'data: {"type":"connected"}\n\n')
             self.wfile.flush()
             while True:
                 try:
-                    payload = client_q.get(timeout=30)
-                    self.wfile.write(payload.encode("utf-8"))
+                    payload = q.get(timeout=25)
+                    self.wfile.write(payload.encode())
                     self.wfile.flush()
                 except queue.Empty:
-                    # keepalive
-                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
             with sse_lock:
-                if client_q in sse_clients:
-                    sse_clients.remove(client_q)
-
-    def _serve_file(self, path: Path, content_type: str):
-        if not path.exists():
-            self._send(404, "text/plain", b"Not Found")
-            return
-        self._send(200, content_type, path.read_bytes())
+                if q in sse_clients:
+                    sse_clients.remove(q)
 
     # ---- ヘルパー ----
-    def _send_json(self, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._send(200, "application/json; charset=utf-8", body)
 
-    def _send(self, code: int, content_type: str, body: bytes):
+    def _file(self, path: Path, ct: str):
+        if not path.exists():
+            return self._send(404, "text/plain", b"Not Found")
+        self._send(200, ct, path.read_bytes())
+
+    def _json(self, code: int, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self._send(code, "application/json; charset=utf-8", body)
+
+    def _send(self, code: int, ct: str, body: bytes):
         self.send_response(code)
-        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
-        self._cors_headers()
+        self._cors()
         self.end_headers()
         self.wfile.write(body)
 
-    def _cors_headers(self):
+    def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
 # ---------------------------------------------------------------------------
-# メイン
+# エントリポイント
 # ---------------------------------------------------------------------------
 def main():
-    if API_KEY == "YOUR_ANTHROPIC_API_KEY_HERE" or not API_KEY:
-        print("[WARNING] config.json の anthropic_api_key を設定するか、")
-        print("          環境変数 ANTHROPIC_API_KEY を設定してください。")
+    if not API_KEY or API_KEY == "YOUR_ANTHROPIC_API_KEY_HERE":
+        print("[WARNING] anthropic_api_key が未設定です（config.json または環境変数 ANTHROPIC_API_KEY）")
 
-    worker = threading.Thread(target=antigravity_worker, daemon=True)
-    worker.start()
-
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    threading.Thread(target=md_watcher,         daemon=True).start()
+    threading.Thread(target=antigravity_worker, daemon=True).start()
 
     import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local_ip = "127.0.0.1"
+
     print(f"\n=== AntiGravity Mobile Bridge ===")
-    print(f"  PC上のURL  : http://localhost:{PORT}")
-    print(f"  スマホからのURL: http://{local_ip}:{PORT}")
-    print(f"  出力MDファイル : {OUTPUT_MD.resolve()}")
+    print(f"  PC         : http://localhost:{PORT}")
+    print(f"  スマホ (LAN): http://{local_ip}:{PORT}")
+    print(f"  出力 MD     : {OUTPUT_MD}")
+    print(f"  入力ファイル : {INPUT_FILE}")
     print(f"  Ctrl+C で停止\n")
 
+    srv = HTTPServer(("0.0.0.0", PORT), Handler)
     try:
-        server.serve_forever()
+        srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nサーバーを停止します...")
-        message_queue.put(None)
-        server.shutdown()
+        print("\n停止します...")
+        msg_queue.put(None)
+        srv.shutdown()
 
 if __name__ == "__main__":
     main()
