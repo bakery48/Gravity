@@ -530,16 +530,35 @@ function reconnect() {
   connectSSE();
 }
 
-// バックグラウンドから戻ったとき再接続
-document.addEventListener('visibilitychange', () => {
+// バックグラウンドから戻ったとき再接続 + 未表示メッセージを補完
+document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible') {
     if (!currentES || currentES.readyState === EventSource.CLOSED) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
       reconnect();
     }
+    await syncMissed();
   }
 });
+
+// 表示済み行数とサーバー履歴を比較し、不足分を追加する
+async function syncMissed() {
+  try {
+    const r = await fetch('/api/history');
+    const h = await r.json();
+    const rows = chatEl.querySelectorAll('.msg-row').length;
+    if (h.length > rows) {
+      hideTyping();
+      for (let i = rows; i < h.length; i++) {
+        const m = h[i];
+        if (m.role === 'user') addMe(m.content);
+        else                   addAi(m.content);
+      }
+      setBusy(false);
+    }
+  } catch(_) {}
+}
 
 // ---- 起動 ----
 connectSSE();
