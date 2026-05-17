@@ -11,6 +11,7 @@ AntiGravity Mobile Bridge Server (Windows)
 - 返答取得: output.md を 500ms 間隔で監視し差分を SSE で配信
 """
 
+import ctypes
 import json
 import os
 import queue
@@ -79,6 +80,52 @@ def push_sse(payload: dict):
             sse_clients.remove(q)
 
 # ---------------------------------------------------------------------------
+# Windows ウィンドウ強制フォアグラウンド
+# ---------------------------------------------------------------------------
+_user32 = ctypes.windll.user32
+
+def _force_foreground(win) -> None:
+    """pygetwindow の win を確実に最前面へ持ってくる。
+    Windows のフォーカス奪い防止を ctypes で回避する。"""
+    try:
+        hwnd = win._hWnd
+    except AttributeError:
+        hwnd = None
+
+    # 最小化されていたら復元
+    try:
+        if win.isMinimized:
+            win.restore()
+            time.sleep(0.15)
+    except Exception:
+        pass
+
+    if hwnd:
+        # SW_RESTORE(9) で復元してから SetForegroundWindow
+        _user32.ShowWindow(hwnd, 9)
+        # スレッドのフォーカスを一時的に共有して SetForegroundWindow を通す
+        cur_thread  = ctypes.windll.kernel32.GetCurrentThreadId()
+        fore_hwnd   = _user32.GetForegroundWindow()
+        fore_thread = _user32.GetWindowThreadProcessId(fore_hwnd, None)
+        if fore_thread != cur_thread:
+            _user32.AttachThreadInput(fore_thread, cur_thread, True)
+        _user32.BringWindowToTop(hwnd)
+        _user32.SetForegroundWindow(hwnd)
+        if fore_thread != cur_thread:
+            _user32.AttachThreadInput(fore_thread, cur_thread, False)
+    else:
+        # hwnd が取れなければ従来の方法にフォールバック
+        try:
+            win.activate()
+        except Exception:
+            try:
+                win.minimize()
+                time.sleep(0.1)
+                win.restore()
+            except Exception:
+                pass
+
+# ---------------------------------------------------------------------------
 # Antigravity ウィンドウへの入力
 # ---------------------------------------------------------------------------
 def send_to_antigravity(text: str) -> tuple[bool, str]:
@@ -91,22 +138,8 @@ def send_to_antigravity(text: str) -> tuple[bool, str]:
 
         win = wins[0]
 
-        # 最小化されていたら復元
-        try:
-            if win.isMinimized:
-                win.restore()
-        except Exception:
-            pass
-
-        # フォアグラウンドへ
-        try:
-            win.activate()
-        except Exception:
-            # Windows で activate に失敗するケースの回避策
-            try:
-                win.minimize(); time.sleep(0.1); win.restore()
-            except Exception:
-                pass
+        # 強制的に最前面へ（Windows フォーカス奪い防止を突破）
+        _force_foreground(win)
 
         time.sleep(PASTE_DELAY_MS / 1000)
 
