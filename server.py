@@ -152,7 +152,7 @@ def send_to_antigravity(text: str) -> tuple[bool, str]:
         return False, str(e)
 
 # ---------------------------------------------------------------------------
-# 入力ワーカー
+# 入力ワーカー（最大3回リトライ）
 # ---------------------------------------------------------------------------
 def input_worker():
     while True:
@@ -160,9 +160,17 @@ def input_worker():
         if text is None:
             break
         print(f"[送信] メッセージ受信: {text!r}")
-        ok, info = send_to_antigravity(text)
+
+        ok, info = False, ""
+        for attempt in range(1, 4):
+            ok, info = send_to_antigravity(text)
+            if ok:
+                break
+            print(f"[送信] 試行 {attempt}/3 失敗: {info}")
+            time.sleep(0.5 * attempt)
+
         if not ok:
-            print(f"[送信] 失敗: {info}")
+            print(f"[送信] 最終失敗: {info}")
             push_sse({"type": "error", "text": f"[入力失敗] {info}"})
         else:
             print(f"[送信] Antigravity へ入力完了")

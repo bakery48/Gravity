@@ -204,6 +204,18 @@
       padding: 12px 16px;
       box-shadow: 0 1px 2px rgba(0,0,0,.12);
       display: flex; gap: 5px; align-items: center;
+      flex-wrap: wrap;
+    }
+    #btn-resend {
+      display: none;
+      margin-left: 4px;
+      padding: 4px 10px;
+      font-size: 12px;
+      background: #e74c3c;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
     }
     .typing-dot {
       width: 7px; height: 7px;
@@ -358,6 +370,9 @@ const statusTxt = document.getElementById('status-txt');
 
 let busy = false;
 let typingRow = null;
+let lastSentText = '';
+let resendTimer = null;
+const RESEND_TIMEOUT_MS = 90_000; // 90秒で再送ボタン表示
 
 // ---- 入力ハンドリング ----
 function onInput() {
@@ -382,8 +397,10 @@ async function send() {
   sendBtn.disabled = true;
   setBusy(true);
 
+  lastSentText = text;
   addMe(text);
   showTyping();
+  startResendTimer();
 
   try {
     const r = await fetch('/api/send', {
@@ -424,15 +441,46 @@ function showTyping() {
   typingRow = el('div', 'typing-row');
   const avatar = el('div', 'ai-avatar', null, '⚡');
   const bub = el('div', 'typing-bubble');
-  bub.innerHTML = '<div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>';
+  bub.innerHTML = '<div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>'
+    + '<button id="btn-resend" onclick="resend()">再送</button>';
   typingRow.append(avatar, bub);
   chatEl.append(typingRow);
   scrollEnd();
 }
 
 function hideTyping() {
+  clearResendTimer();
   typingRow?.remove();
   typingRow = null;
+}
+
+// ---- 再送タイマー ----
+function startResendTimer() {
+  clearResendTimer();
+  resendTimer = setTimeout(() => {
+    const btn = document.getElementById('btn-resend');
+    if (btn) btn.style.display = 'inline-block';
+  }, RESEND_TIMEOUT_MS);
+}
+
+function clearResendTimer() {
+  clearTimeout(resendTimer);
+  resendTimer = null;
+}
+
+async function resend() {
+  if (!lastSentText) return;
+  hideTyping();
+  const text = lastSentText;
+  showTyping();
+  startResendTimer();
+  try {
+    await fetch('/api/send', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({message: text})
+    });
+  } catch(_) {}
 }
 
 // ---- 状態 ----
